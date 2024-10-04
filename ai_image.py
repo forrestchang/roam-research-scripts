@@ -20,6 +20,9 @@ client = OpenAI(
 )
 
 base_url = f"https://api.roamresearch.com/api/graph/{os.getenv('ROAM_GRAPH_NAME')}"
+append_url = (
+    f"https://append-api.roamresearch.com/api/graph/{os.getenv('ROAM_GRAPH_NAME')}"
+)
 
 headers = {
     "accept": "application/json",
@@ -81,18 +84,22 @@ def get_children_blocks(block_id: str) -> List[str]:
     return response.json().get("result", {}).get(":block/children", [])
 
 
-def write_new_block(block_id: str, content: str):
+def write_new_block(block_id: str, type: str, content: str):
+    if type == "caption":
+        type_block = "Image Caption::"
+    elif type == "ocr":
+        type_block = "Image OCR::"
+
     data = {
-        "action": "create-block",
-        "location": {"parent-uid": block_id, "order": "first"},
-        "block": {
-            "string": content,
-            "open": False,
+        "location": {
+            "block": {"uid": block_id},
+            "nest-under": {"string": type_block},
         },
+        "append-data": [{"string": content}],
     }
 
     response = requests.post(
-        f"{base_url}/write", headers=headers, data=json.dumps(data)
+        f"{append_url}/append-blocks", headers=headers, data=json.dumps(data)
     )
     return response
 
@@ -225,14 +232,14 @@ def add_image_caption_and_ocr_result(image_block: list):
     if not has_ocr:
         print("Adding new OCR block...")
         ocr = "\n\n".join(image_ocr_results)
-        write_new_block(image_block_id, f"Image OCR:: {ocr}")
+        write_new_block(image_block_id, "ocr", ocr)
     else:
         print("OCR already exists. Skipping.")
 
     if not has_caption:
         print("Adding new caption block...")
         caption = "\n\n".join(image_captions)
-        write_new_block(image_block_id, f"Image Caption:: {caption}")
+        write_new_block(image_block_id, "caption", caption)
     else:
         print("Caption already exists. Skipping.")
 
