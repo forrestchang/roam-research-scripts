@@ -54,3 +54,5 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+processed_blocks.db

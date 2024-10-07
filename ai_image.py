@@ -1,7 +1,11 @@
+import functools
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List
 from urllib.parse import urlparse
@@ -47,6 +51,7 @@ This is a detailed description of the image.
 """
 
 
+@functools.lru_cache(maxsize=None)
 def get_all_image_blocks():
     query = """
 [:find ?block-uid ?block-str
@@ -72,6 +77,7 @@ def fetch_image_urls(block: str) -> List[str]:
     return urls
 
 
+@functools.lru_cache(maxsize=100)
 def get_children_blocks(block_id: str) -> List[str]:
     data = {
         "eid": f'[:block/uid "{block_id}"]',
@@ -84,11 +90,8 @@ def get_children_blocks(block_id: str) -> List[str]:
     return response.json().get("result", {}).get(":block/children", [])
 
 
-def write_new_block(block_id: str, type: str, content: str):
-    if type == "caption":
-        type_block = "Image Caption::"
-    elif type == "ocr":
-        type_block = "Image OCR::"
+def write_new_block(block_id: str, content: str):
+    type_block = "Image Caption::"
 
     data = {
         "location": {
@@ -162,14 +165,37 @@ def generate_image_ocr_result(image_url: str) -> str:
     return ocr_result
 
 
-def generate_image_caption(image_url: str) -> str:
+def generate_image_caption(image_url: str, image_context: str, image_ocr: str) -> str:
+    PROMPT = f"""
+    请帮我按照下列需求来处理图片的内容：
+
+    1. 我会提供图片中 OCR 的文本，在 <OCR_TEXT></OCR_TEXT> 中，图片的语境上下文会补充在 <IMAGE_CONTEXT></IMAGE_CONTEXT> 中
+    2. 首先格式化 OCR 中的文本，如果 OCR 内容有部分缺失，请按照上下文补全（但是不要补全错误的信息），如果是英文内容，翻译一份中文版本（同时保留英文原文），使用易于阅读的格式，使用 markdown 格式（不使用标题）
+    3. 根据图片 & OCR 文本解释图片
+    4. 生成便于未来检索的关键词，使用中文 & 英文，多个关键词中使用 `,` 分隔，对于专有名词，不需要翻译成中文。关键词例子：Python, LLM (Large Language Model, 大预言模型)
+
+    <OCR_TEXT>
+    {image_ocr}
+    </OCR_TEXT>
+
+    <IMAGE_CONTEXT>
+    {image_context}
+    </IMAGE_CONTEXT>
+
+    最终的输出格式：
+    **OCR Result**
+
+    **Image Explanation**
+
+    **Keywords**
+    """
     completion = client.chat.completions.create(
         model="openai/gpt-4o-mini-2024-07-18",
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": CAPTION_PROMPT},
+                    {"type": "text", "text": PROMPT},
                     {
                         "type": "image_url",
                         "image_url": {"url": image_url},
@@ -183,81 +209,79 @@ def generate_image_caption(image_url: str) -> str:
 
 
 def add_image_caption_and_ocr_result(image_block: list):
-    image_block_id = image_block[0]
+    block_id = image_block[0]
     image_block_content = image_block[1]
-    print(f"\nProcessing block: {image_block_id}")
+    print(f"\nProcessing block: {block_id}")
     print(f"Block content: {image_block_content[:50]}...")  # Print first 50 characters
 
-    children_blocks = get_children_blocks(image_block_id)
+    children_blocks = get_children_blocks(block_id)
     print(f"Number of child blocks: {len(children_blocks)}")
 
     has_caption = False
-    has_ocr = False
 
     for child in children_blocks:
         if child[":block/string"].startswith("Image Caption::"):
             has_caption = True
-        elif child[":block/string"].startswith("Image OCR::"):
-            has_ocr = True
 
-    print(f"Existing caption: {has_caption}, Existing OCR: {has_ocr}")
+    print(f"Existing caption: {has_caption}")
 
     # If both caption and OCR exist, skip processing
-    if has_caption and has_ocr:
-        print("Both caption and OCR already exist. Skipping processing.")
+    if has_caption:
+        print("Caption already exists. Skipping processing.")
         return
 
     image_urls = fetch_image_urls(image_block_content)
     print(f"Number of images in block: {len(image_urls)}")
 
-    image_ocr_results = []
     image_captions = []
-    for i, image_url in enumerate(image_urls, 1):
-        print(f"\nProcessing image {i}/{len(image_urls)}")
-        if is_valid_image(image_url):
-            if not has_ocr:
-                print("Generating OCR result...")
-                ocr_result = generate_image_ocr_result(image_url)
-                image_ocr_results.append(ocr_result)
-                print(f"OCR result (first 50 chars): {ocr_result[:50]}...")
-
-            if not has_caption:
-                print("Generating image caption...")
-                caption = generate_image_caption(image_url)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_url = {
+            executor.submit(process_image, url, image_block_content): url
+            for url in image_urls
+        }
+        for future in as_completed(future_to_url):
+            caption = future.result()
+            if caption:
                 image_captions.append(caption)
-                print(f"Caption (first 50 chars): {caption[:50]}...")
-        else:
-            print(f"Skipping invalid image: {image_url}")
 
-    if not has_ocr:
-        print("Adding new OCR block...")
-        ocr = "\n\n".join(image_ocr_results)
-        write_new_block(image_block_id, "ocr", ocr)
-    else:
-        print("OCR already exists. Skipping.")
-
-    if not has_caption:
-        print("Adding new caption block...")
-        caption = "\n\n".join(image_captions)
-        write_new_block(image_block_id, "caption", caption)
-    else:
-        print("Caption already exists. Skipping.")
+    print("Adding new caption block...")
+    caption = "\n\n".join(image_captions)
+    write_new_block(block_id, caption)
 
     print("Block processing complete.")
 
 
-def load_processed_blocks():
-    cache_file = Path("processed_blocks_cache.json")
-    if cache_file.exists():
-        with open(cache_file, "r") as f:
-            return set(json.load(f))
-    return set()
+def process_image(image_url, image_block_content):
+    if is_valid_image(image_url):
+        ocr_result = generate_image_ocr_result(image_url)
+        caption = generate_image_caption(image_url, image_block_content, ocr_result)
+        return caption
+    return None
 
 
-def save_processed_blocks(processed_blocks):
-    cache_file = Path("processed_blocks_cache.json")
-    with open(cache_file, "w") as f:
-        json.dump(list(processed_blocks), f)
+def init_db():
+    conn = sqlite3.connect("processed_blocks.db")
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS processed_blocks
+                 (block_id TEXT PRIMARY KEY)"""
+    )
+    conn.commit()
+    return conn
+
+
+def is_block_processed(conn, block_id):
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM processed_blocks WHERE block_id = ?", (block_id,))
+    return c.fetchone() is not None
+
+
+def mark_block_processed(conn, block_id):
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO processed_blocks (block_id) VALUES (?)", (block_id,)
+    )
+    conn.commit()
 
 
 # Main execution
@@ -265,18 +289,15 @@ print("Starting image block processing...")
 image_blocks = get_all_image_blocks()
 print(f"Total number of image blocks: {len(image_blocks)}")
 
-processed_blocks = load_processed_blocks()
-print(f"Number of previously processed blocks: {len(processed_blocks)}")
-
-# Wrap the loop with tqdm for a progress bar
+conn = init_db()
 for block in tqdm(image_blocks, desc="Processing image blocks", unit="block"):
     block_id = block[0]
-    if block_id not in processed_blocks:
+    if not is_block_processed(conn, block_id):
         add_image_caption_and_ocr_result(block)
-        processed_blocks.add(block_id)
+        mark_block_processed(conn, block_id)
     else:
         print(f"Skipping already processed block: {block_id}")
 
-save_processed_blocks(processed_blocks)
+conn.close()
 
 print("All image blocks processed. Script execution complete.")
